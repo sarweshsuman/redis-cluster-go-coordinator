@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -13,14 +11,17 @@ import (
 )
 
 func main() {
+	fmt.Println("Connecting to local redis.")
 	session, err := utils.CreateRedisSession()
 	if err != nil {
 		panic(err)
 	}
+	fmt.Println("Connected.")
 
 	var flagIsClusterCreated = false
 	var redisClusterSeedNodes = []string{}
 
+	fmt.Println("Checking if cluster is already created or not?")
 	val, err := session.Connection.Exists(config.FlagIsClusterCreated).Result()
 	if err != nil {
 		panic(err)
@@ -36,40 +37,48 @@ func main() {
 		} else {
 			flagIsClusterCreated = false
 		}
-
 	} else {
 		flagIsClusterCreated = false
 	}
 
 	if flagIsClusterCreated == false {
 
+		fmt.Println("Cluster is not created, will wait for all the seed nodes to register request.")
 		var val int64
+
 		val, err = session.Connection.LLen(config.ClusterRegistrationQueue).Result()
 		if err != nil {
-			panic(err)
+			fmt.Printf("Error %v in retrieving length of ClusterRegistrationQueue\n", err)
+			val = 0
 		}
 
+		// Wait for all the nodes to register request.
 		for val < config.NumOfSeedNodes {
 			time.Sleep(5 * time.Second)
 
 			val, err = session.Connection.LLen(config.ClusterRegistrationQueue).Result()
 			if err != nil {
-				panic(err)
+				fmt.Printf("Error %v in retrieving length of ClusterRegistrationQueue\n", err)
+				val = 0
+				continue
 			}
 		}
 
-		redisClusterCreateCmd := []string{}
+		fmt.Println("All seed nodes have registed request, Moving ahead with cluster creation.")
 
+		redisClusterCreateCmd := []string{}
 		redisClusterCreateCmd = append(redisClusterCreateCmd, "--cluster")
 		redisClusterCreateCmd = append(redisClusterCreateCmd, "create")
 
 		for i := int64(0); i < config.NumOfSeedNodes; i++ {
 			val, err := session.Connection.RPop(config.ClusterRegistrationQueue).Result()
 			if err != nil {
-				panic(err)
+				fmt.Printf("Error %v in retrieving seed nodes from ClusterRegistrationQueue, re-attempt in few seconds\n", err)
+				i--
+				time.Sleep(10 * time.Second)
+				continue
 			}
 			redisClusterCreateCmd = append(redisClusterCreateCmd, val)
-			session.Connection.LPush(config.RegisteredNodesQueue, val)
 			redisClusterSeedNodes = append(redisClusterSeedNodes, val)
 		}
 
@@ -77,227 +86,241 @@ func main() {
 		redisClusterCreateCmd = append(redisClusterCreateCmd, config.ClusterReplicas)
 		redisClusterCreateCmd = append(redisClusterCreateCmd, "--cluster-yes")
 
-		//joinedRedisClusterNode := strings.TrimLeft(strings.Join(redisClusterNodes, " "), " ")
-		cmd := exec.Command("redis-cli", redisClusterCreateCmd...)
-
-		var out bytes.Buffer
-
-		cmd.Stdout = &out
-		cmd.Stderr = &out
-
-		err := cmd.Run()
-		if err != nil {
-			fmt.Printf("Failed to create cluster.\n%v\n", out.String())
-			panic(err)
-		}
-		fmt.Printf("Created cluster successful.\n%v\n", out.String())
-
-		session.Connection.Set(config.FlagIsClusterCreated, "true", 0)
-
-	}
-	// Cluster is created, lets monitor and add nodes if needed
-
-	if len(redisClusterSeedNodes) == 0 {
-		redisClusterSeedNodes, err = session.Connection.LRange(config.RegisteredNodesQueue, 0, -1).Result()
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	fmt.Println("Starting monitoring for additional nodes")
-	for true {
-		var val int64
-		val, err = session.Connection.LLen(config.ClusterRegistrationQueue).Result()
-		if err != nil {
-			panic(err)
-		}
-
-		if val > 0 {
-			node, err := session.Connection.RPop(config.ClusterRegistrationQueue).Result()
+		for {
+			err = utils.RedisCliCmd(redisClusterCreateCmd)
 			if err != nil {
-				panic(err)
+				fmt.Printf("Cluster creation failed due to %v, re-attempt in few seconds\n", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			break
+		}
+
+		for idx := range redisClusterSeedNodes {
+			session.Connection.LPush(config.RegisteredNodesQueue, redisClusterSeedNodes[idx])
+		}
+		session.Connection.Set(config.FlagIsClusterCreated, "true", 0)
+		fmt.Println("Cluster creation complete.")
+
+	} else {
+		fmt.Println("Cluster is already created.")
+	}
+
+	// Cluster is created, lets monitor and add nodes if needed
+	if len(redisClusterSeedNodes) == 0 {
+		for {
+			redisClusterSeedNodes, err = session.Connection.LRange(config.RegisteredNodesQueue, 0, -1).Result()
+			if err != nil {
+				fmt.Printf("Error %v in retrieving seed nodes, re-attempt in few seconds\n", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			break
+		}
+	}
+
+	fmt.Printf("Seed Nodes registered are %v\n", redisClusterSeedNodes)
+	fmt.Println("Starting monitoring for additional nodes.")
+
+MAINLOOP:
+	for true {
+
+		var queueLength int64
+		queueLength, err = session.Connection.LLen(config.ClusterRegistrationQueue).Result()
+		if err != nil {
+			fmt.Printf("Error %v in retrieving ClusterRegistrationQueue queue length\n", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		if queueLength > 0 {
+
+			newNode, err := session.Connection.RPop(config.ClusterRegistrationQueue).Result()
+			if err != nil {
+				fmt.Printf("Error %v in retrieving node from ClusterRegistrationQueue\n", err)
+				time.Sleep(10 * time.Second)
+				continue
 			}
 
-			fmt.Printf("Found a node to add %v\n", node)
-			redisClusterAddCmd := []string{}
+			fmt.Printf("Found a node to process %v\n", newNode)
 
+			redisClusterAddCmd := []string{}
 			redisClusterAddCmd = append(redisClusterAddCmd, "--cluster")
 			redisClusterAddCmd = append(redisClusterAddCmd, "add-node")
-			redisClusterAddCmd = append(redisClusterAddCmd, node)
-			fmt.Println(redisClusterSeedNodes)
+			redisClusterAddCmd = append(redisClusterAddCmd, newNode)
+
 			for i := 0; i < len(redisClusterSeedNodes); i++ {
 				redisClusterAddCmd = append(redisClusterAddCmd, redisClusterSeedNodes[i])
-				cmd := exec.Command("redis-cli", redisClusterAddCmd...)
 
-				fmt.Println(cmd)
-
-				var out bytes.Buffer
-
-				cmd.Stdout = &out
-				cmd.Stderr = &out
-
-				err := cmd.Run()
+				fmt.Printf("Attempting to add node with seed node %v\n", redisClusterSeedNodes[i])
+				err = utils.RedisCliCmd(redisClusterAddCmd)
 				if err != nil {
-					fmt.Printf("Failed to add %v to cluster.\n%v\n", node, out.String())
+					fmt.Printf("Failed to add %v to cluster.\n", newNode)
+					fmt.Printf("Error: %v\n", err)
+
 					redisClusterAddCmd = redisClusterAddCmd[0 : len(redisClusterAddCmd)-1]
 
 					if i == len(redisClusterSeedNodes)-1 {
-						fmt.Printf("Failed to register node %v with any cluster nodes.", node)
-						panic("Failed to register node")
+						fmt.Printf("Failed to register node %v with any cluster nodes.re-attempt in few seconds\n", newNode)
+						session.Connection.LPush(config.ClusterRegistrationQueue, newNode)
+						time.Sleep(10 * time.Second)
+						continue MAINLOOP
 					}
 					continue
 				}
-				fmt.Printf("Added %v to cluster successfully.\n%v\n", node, out.String())
-				session.Connection.LPush(config.PendingClusterNodes, node)
+
+				fmt.Printf("Added %v to cluster successfully. Added to the PendingClusterNodes Queue.\n", newNode)
+				session.Connection.LPush(config.PendingClusterNodes, newNode)
 				break
 			}
 
-		}
+		} // End of queueLength > 0 if statment
 
+		// Will wait 10 seconds before start to either process that node as master with some slots or slave to some existing master.
 		time.Sleep(10 * time.Second)
 
-		val, err = session.Connection.LLen(config.PendingClusterNodes).Result()
+		queueLength, err = session.Connection.LLen(config.PendingClusterNodes).Result()
 		if err != nil {
-			panic(err)
+			fmt.Printf("Error %v in retrieving PendingClusterNode queue length\n", err)
+			time.Sleep(10 * time.Second)
+			continue
 		}
 
-		if val > 0 {
-			node, err := session.Connection.RPop(config.PendingClusterNodes).Result()
-			if err != nil {
-				panic(err)
-			}
-			fmt.Printf("Found a cluster node to process as master or slave %v\n", node)
+		if queueLength > 0 {
 
-			fmt.Println("Checking if any existing master nodes memory is above limit")
+			newNode, err := session.Connection.RPop(config.PendingClusterNodes).Result()
+			if err != nil {
+				fmt.Printf("Error %v in retrieving node from PendingClusterNodes\n", err)
+				continue
+			}
+
+			fmt.Printf("Found a cluster node to process as master or slave %v.\n", newNode)
+			fmt.Printf("Attempt to add node %v as master and taking some slots from a master with most memory usage.\n", newNode)
+
+			var masterNodes []map[string]string
+
+			for idx := 0; idx < len(redisClusterSeedNodes); idx++ {
+				masterNodes, err = utils.GetClusterMasterNodes(redisClusterSeedNodes[idx])
+				if err != nil {
+					fmt.Printf("Error %v while retrieving master nodes via node %v.\n", err, redisClusterSeedNodes[idx])
+					if idx == len(redisClusterSeedNodes)-1 {
+						fmt.Println("All attempts exhausted, will re-attempt in few seconds")
+						time.Sleep(10 * time.Second)
+						continue MAINLOOP
+					}
+					continue
+				}
+				fmt.Printf("Got the list of master nodes %v.\n", masterNodes)
+				break
+			}
+
 			maxMemory := 0
 			maxMemoryNodeID := -1
 			// Get Master with Highest Memory
-			for idx := range redisClusterSeedNodes {
-				connection, err := utils.CreateRedisSessionTo(redisClusterSeedNodes[idx])
+			for idx := 0; idx < len(masterNodes); idx++ {
+				memoryInStr, err := utils.GetNodeMemoryUsage(masterNodes[idx]["ip"])
 				if err != nil {
-					panic(err)
+					fmt.Printf("Error in retrieving memory details for master node %v\n", masterNodes[idx]["ip"])
+					continue
 				}
-				isMaster, err := connection.IsMaster()
-				if err != nil {
-					panic(err)
+				if masterNodes[idx]["ip"] == newNode {
+					continue
 				}
-				if isMaster == true {
-					fmt.Printf("Checking master %v\n", redisClusterSeedNodes[idx])
 
-					memoryInStr, err := connection.GetNodeMemoryUsage()
-					if err != nil {
-						panic(err)
-					}
-					memoryInInt, err := strconv.Atoi(*memoryInStr)
-					if err != nil {
-						panic(err)
-					}
-					if memoryInInt > maxMemory {
-						maxMemory = memoryInInt
-						maxMemoryNodeID = idx
-					}
+				memoryInInt, err := strconv.Atoi(*memoryInStr)
+				if err != nil {
+					fmt.Printf("Error in retrieving memory details for master node %v\n", masterNodes[idx]["ip"])
+					continue
 				}
+
+				if memoryInInt > maxMemory {
+					maxMemory = memoryInInt
+					maxMemoryNodeID = idx
+				}
+
 			}
+			fmt.Printf("Node with Max Memory Usage: %v Memory Usage: %v \n", masterNodes[maxMemoryNodeID]["ip"], maxMemory)
 
-			fmt.Printf("Node with Max Memory Usage Found %v Max Memory %v \n", redisClusterSeedNodes[maxMemoryNodeID], maxMemory)
-
+			fmt.Println("Checking if a master node exists whose memory usage is more than threshold")
 			if maxMemoryNodeID != -1 && float64(maxMemory) > config.MemoryThresholdForRedis {
 				// Take Slot from Master maxMemoryNodeID
 
-				fmt.Println("Max Memory is above threshold, will proceed to reshard this master")
+				fmt.Printf("Master node %v has memory usage more than threshold, attempt to take some slots from this master memory.\n", masterNodes[maxMemoryNodeID]["ip"])
 
 				redisClusterReshardCmd := []string{}
-
 				redisClusterReshardCmd = append(redisClusterReshardCmd, "--cluster")
 				redisClusterReshardCmd = append(redisClusterReshardCmd, "reshard")
-				redisClusterReshardCmd = append(redisClusterReshardCmd, redisClusterSeedNodes[maxMemoryNodeID])
+				redisClusterReshardCmd = append(redisClusterReshardCmd, masterNodes[maxMemoryNodeID]["ip"])
 				redisClusterReshardCmd = append(redisClusterReshardCmd, "--cluster-from")
-				nodeID, err := utils.GetNodeID(redisClusterSeedNodes[maxMemoryNodeID])
-				if err != nil {
-					panic(err)
-				}
-
-				redisClusterReshardCmd = append(redisClusterReshardCmd, *nodeID)
+				redisClusterReshardCmd = append(redisClusterReshardCmd, masterNodes[maxMemoryNodeID]["nodeid"])
 				redisClusterReshardCmd = append(redisClusterReshardCmd, "--cluster-to")
 
-				nodeID, err = utils.GetNodeID(node)
+				nodeID, err := utils.GetNodeID(newNode)
 				if err != nil {
-					panic(err)
+					fmt.Printf("Error %v while retrieving new node %v nodeid\n", err, newNode)
+					session.Connection.LPush(config.PendingClusterNodes, newNode)
+					time.Sleep(10 * time.Second)
+					continue MAINLOOP
 				}
 				redisClusterReshardCmd = append(redisClusterReshardCmd, *nodeID)
 				redisClusterReshardCmd = append(redisClusterReshardCmd, "--cluster-slots")
 
-				slots, err := utils.GetNodeTotalSlots(redisClusterSeedNodes[maxMemoryNodeID])
-				fmt.Println()
-				fmt.Println(*slots)
-				fmt.Println()
-				if err != nil {
-					panic(err)
+				slots, ok := masterNodes[maxMemoryNodeID]["slots"]
+				if ok == false {
+					fmt.Printf("Unable to retireve slots for master node %v\n", masterNodes[maxMemoryNodeID]["ip"])
+					session.Connection.LPush(config.PendingClusterNodes, newNode)
+					time.Sleep(10 * time.Second)
+					continue MAINLOOP
 				}
 
-				redisClusterReshardCmd = append(redisClusterReshardCmd, strconv.Itoa((*slots)/2))
+				slotsInInt, err := strconv.Atoi(slots)
+				if err != nil {
+					fmt.Printf("Unable to convert slots %v of master node %v to string\n", slots, masterNodes[maxMemoryNodeID]["ip"])
+					session.Connection.LPush(config.PendingClusterNodes, newNode)
+					time.Sleep(10 * time.Second)
+					continue MAINLOOP
+				}
+
+				redisClusterReshardCmd = append(redisClusterReshardCmd, strconv.Itoa((slotsInInt)/2))
 				redisClusterReshardCmd = append(redisClusterReshardCmd, "--cluster-yes")
 
-				cmd := exec.Command("redis-cli", redisClusterReshardCmd...)
-
-				fmt.Println(cmd)
-
-				var out bytes.Buffer
-
-				cmd.Stdout = &out
-				cmd.Stderr = &out
-
-				err = cmd.Run()
+				err = utils.RedisCliCmd(redisClusterReshardCmd)
 				if err != nil {
-					fmt.Printf("Failed to transfer slot %v to cluster.\n%v\n", node, out.String())
-					panic(err)
+					fmt.Printf("Error %v in resharding slots from %v to %v\n", err, masterNodes[maxMemoryNodeID]["ip"], newNode)
+					session.Connection.LPush(config.PendingClusterNodes, newNode)
+					time.Sleep(10 * time.Second)
+					continue MAINLOOP
 				}
-				fmt.Printf("Successfully transfered slots to node %v.\n%v\n", node, out.String())
 
-				session.Connection.LPush(config.RegisteredNodesQueue, node)
+				session.Connection.LPush(config.RegisteredNodesQueue, newNode)
+				fmt.Printf("Processing of new node %v complete.\n", newNode)
 
 			} else {
-				// Will Look If some slave is down and add it there
 
-				fmt.Printf("Will attempt to add the node %v as a slave of existing master if a slave is missing from any master.\n", node)
-
-				clusterClientNode, err := utils.CreateRedisSessionTo(redisClusterSeedNodes[0])
-				if err != nil {
-					panic(err)
-				}
-
-				// Checking Slaves
-				masterNodes, err := clusterClientNode.GetClusterMasterNodes()
-				if err != nil {
-					panic(err)
-				}
-
-				fmt.Printf("List of Master Nodes %v\n", masterNodes)
+				fmt.Println("No master node exists with high memory usage. Therefore,")
+				fmt.Printf("Attempt to add node %v as slave of existing master if a slave is missing from any master.\n", newNode)
 
 				flagNodeProcessed := false
 
 				for idx := range masterNodes {
 
-					_, ok := masterNodes[idx]["slots"]
-					if ok == false {
+					if newNode == masterNodes[idx]["ip"] {
 						continue
 					}
 
-					slaves, err := clusterClientNode.GetSlavesForAMaster(masterNodes[idx]["nodeid"])
+					slaves, err := utils.GetSlavesForAMaster(masterNodes[idx]["ip"], masterNodes[idx]["nodeid"])
 					if err != nil {
-						panic(err)
+						fmt.Printf("Error %v in retrieving list of slaves for master node %v\n", err, masterNodes[idx]["ip"])
+						continue
 					}
 
-					fmt.Printf("List of Slaves for Master NodeID \n%v : %v\n", masterNodes[idx], slaves)
+					fmt.Printf("Slaves for master node %v : %v\n", masterNodes[idx]["ip"], slaves)
 					if len(slaves) < config.MinNoOfSlaves {
 
-						// redis-cli -p 7007 cluster replicate 5111d7b0ef9124d5682ccdbdeeedcb4a3960b5a3
-						// Configure this Node as Slave
-						// break, continue
+						fmt.Printf("Num of Slaves less than min threshold of %v\n", config.MinNoOfSlaves)
+
 						redisClusterAddSlaveCmd := []string{}
-
-						arr := strings.Split(node, ":")
-
+						arr := strings.Split(newNode, ":")
 						redisClusterAddSlaveCmd = append(redisClusterAddSlaveCmd, "-h")
 						redisClusterAddSlaveCmd = append(redisClusterAddSlaveCmd, arr[0])
 						redisClusterAddSlaveCmd = append(redisClusterAddSlaveCmd, "-p")
@@ -306,40 +329,32 @@ func main() {
 						redisClusterAddSlaveCmd = append(redisClusterAddSlaveCmd, "replicate")
 						redisClusterAddSlaveCmd = append(redisClusterAddSlaveCmd, masterNodes[idx]["nodeid"])
 
-						cmd := exec.Command("redis-cli", redisClusterAddSlaveCmd...)
-
-						fmt.Println(cmd)
-
-						var out bytes.Buffer
-
-						cmd.Stdout = &out
-						cmd.Stderr = &out
-
-						err = cmd.Run()
+						err = utils.RedisCliCmd(redisClusterAddSlaveCmd)
 						if err != nil {
-							fmt.Printf("Failed to add node %v as slave.\n%v\n", node, out.String())
-							panic(err)
+							fmt.Printf("Error in registering new node %v as replica of master node %v\n", newNode, masterNodes[idx]["ip"])
+							continue
 						}
-						fmt.Printf("Successfully added node %v as slave.\n%v\n", node, out.String())
 
-						session.Connection.LPush(config.RegisteredNodesQueue, node)
+						session.Connection.LPush(config.RegisteredNodesQueue, newNode)
 						flagNodeProcessed = true
 
+						fmt.Printf("Successfully configured node %v to be replica of node %v\n", newNode, masterNodes[idx]["ip"])
 						break
 
-					}
+					} // end of if len(slaves) < config.MinNoOfSlaves
 
-				}
+				} // end of for line num 268
 
 				if flagNodeProcessed == false {
-					session.Connection.LPush(config.PendingClusterNodes, node)
+					fmt.Printf("Unable to process new node %v as neither memory or slave condition satisfied\n", newNode)
+					session.Connection.LPush(config.PendingClusterNodes, newNode)
 				}
 
-			}
+			} // end of else for line num 278
 
-		}
+		} // end of if queueLength > 0
 
 		time.Sleep(5 * time.Second)
-	}
+	} // end of for true
 
 }

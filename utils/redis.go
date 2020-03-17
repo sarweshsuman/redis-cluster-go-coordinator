@@ -65,12 +65,18 @@ func CreateClusterRedisSession(clusterNodes []string) (*RedisSession, error) {
 	return session, nil
 }
 
-func (clusterClient *RedisSession) GetClusterMasterNodes() ([]map[string]string, error) {
+func GetClusterMasterNodes(nodeIP string) ([]map[string]string, error) {
 
-	nodesInStr, err := clusterClient.Connection.ClusterNodes().Result()
+	session, err := CreateRedisSessionTo(nodeIP)
 	if err != nil {
 		return nil, err
 	}
+
+	nodesInStr, err := session.Connection.ClusterNodes().Result()
+	if err != nil {
+		return nil, err
+	}
+
 	nodes := strings.Split(nodesInStr, "\n")
 	var masterNode = []map[string]string{}
 
@@ -101,20 +107,30 @@ func (clusterClient *RedisSession) GetClusterMasterNodes() ([]map[string]string,
 	return masterNode, nil
 }
 
-func (clusterClient *RedisSession) GetSlavesForAMaster(masterNode string) ([]string, error) {
+func GetSlavesForAMaster(nodeIP string, nodeID string) ([]string, error) {
 
-	slaves, err := clusterClient.Connection.ClusterSlaves(masterNode).Result()
+	session, err := CreateRedisSessionTo(nodeIP)
+	if err != nil {
+		return nil, err
+	}
+
+	slaves, err := session.Connection.ClusterSlaves(nodeID).Result()
 	if err != nil {
 		return nil, err
 	}
 	return slaves, nil
 }
 
-func (clusterClient *RedisSession) GetNodeMemoryUsage() (*string, error) {
+func GetNodeMemoryUsage(nodeIP string) (*string, error) {
+
+	session, err := CreateRedisSessionTo(nodeIP)
+	if err != nil {
+		return nil, err
+	}
 
 	re := regexp.MustCompile(`used_memory:([0-9]+)`)
 
-	strVal, err := clusterClient.Connection.Info("memory").Result()
+	strVal, err := session.Connection.Info("memory").Result()
 	if err != nil {
 		return nil, err
 	}
@@ -145,15 +161,16 @@ func (client *RedisSession) IsMaster() (bool, error) {
 
 func GetNodeID(node string) (*string, error) {
 
-	client, err := CreateRedisSessionTo(node)
+	session, err := CreateRedisSessionTo(node)
 	if err != nil {
 		return nil, err
 	}
 
-	nodesInStr, err := client.Connection.ClusterNodes().Result()
+	nodesInStr, err := session.Connection.ClusterNodes().Result()
 	if err != nil {
 		return nil, err
 	}
+
 	nodes := strings.Split(nodesInStr, "\n")
 
 	for idx := range nodes {
