@@ -274,6 +274,8 @@ func main() {
 
 				fmt.Printf("List of Master Nodes %v\n", masterNodes)
 
+				flagNodeProcessed := false
+
 				for idx := range masterNodes {
 
 					_, ok := masterNodes[idx]["slots"]
@@ -321,12 +323,18 @@ func main() {
 						fmt.Printf("Successfully added node %v as slave.\n%v\n", node, out.String())
 
 						session.Connection.LPush(config.RegisteredNodesQueue, node)
+						flagNodeProcessed = true
 
 						break
 
 					}
 
 				}
+
+				if flagNodeProcessed == false {
+					session.Connection.LPush(config.PendingClusterNodes, node)
+				}
+
 			}
 
 		}
