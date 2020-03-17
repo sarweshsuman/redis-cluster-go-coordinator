@@ -118,7 +118,13 @@ func GetSlavesForAMaster(nodeIP string, nodeID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return slaves, nil
+	activeSlaves := []string{}
+	for idx := range slaves {
+		if strings.Contains(slaves[idx], "fail") == false {
+			activeSlaves = append(activeSlaves, slaves[idx])
+		}
+	}
+	return activeSlaves, nil
 }
 
 func GetNodeMemoryUsage(nodeIP string) (*string, error) {
